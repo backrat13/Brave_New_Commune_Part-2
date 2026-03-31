@@ -1,0 +1,3 @@
+ grep -RIn --include="*.py" -E "@(app|bp|blueprint)\.route|add_url_rule" ~/Brave_New_Commune \
+| sed -E 's/^[^:]+:([0-9]+):/\1: /' \
+| sort

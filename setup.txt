@@ -1,0 +1,338 @@
+# Brave New Commune — Full Setup Guide
+## Rust Daemons + Search Integration
+
+---
+
+## PART 1: INSTALLING RUST (if you don't have it)
+
+You only need to do this once. Rust installs entirely in your home folder — no sudo needed.
+
+**Open a terminal and run:**
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+When it asks, press **Enter** to accept the default installation.
+
+When it finishes, run:
+```bash
+source ~/.cargo/env
+```
+
+Verify it worked:
+```bash
+rustc --version
+# Should print something like: rustc 1.78.0
+```
+
+You never need to touch Rust code directly. `cargo` (Rust's package manager) does everything.
+
+---
+
+## PART 2: SETTING UP THE TWO DAEMONS
+
+These are two separate programs that each get their own folder. Think of them like two small background services, similar to how Ollama runs in the background.
+
+### 2A — pulse_cache (short-term working memory)
+
+```bash
+# Create the project folder
+mkdir -p ~/Brave_New_Commune/rust_daemons/pulse_cache/src
+
+# Copy the Cargo.toml and main.rs files provided into those folders:
+# ~/Brave_New_Commune/rust_daemons/pulse_cache/Cargo.toml
+# ~/Brave_New_Commune/rust_daemons/pulse_cache/src/main.rs
+
+# Build it (first build downloads dependencies — takes 1-3 minutes, normal)
+cd ~/Brave_New_Commune/rust_daemons/pulse_cache
+cargo build --release
+
+# The compiled binary will be at:
+# ~/Brave_New_Commune/rust_daemons/pulse_cache/target/release/pulse_cache
+```
+
+### 2B — memory_garden (infinite long-term vault + WebSocket)
+
+```bash
+mkdir -p ~/Brave_New_Commune/rust_daemons/memory_garden/src
+
+# Copy Cargo.toml and main.rs for memory_garden into those folders.
+
+cd ~/Brave_New_Commune/rust_daemons/memory_garden
+cargo build --release
+
+# Binary will be at:
+# ~/Brave_New_Commune/rust_daemons/memory_garden/target/release/memory_garden
+```
+
+---
+
+## PART 3: RUNNING THE DAEMONS
+
+Yes — these run in **separate terminals** from the Python sim. You will have 3 terminals open:
+- Terminal 1: Python sim (`python bravenewcommune.py`)
+- Terminal 2: pulse_cache daemon
+- Terminal 3: memory_garden daemon
+
+**Terminal 2 — start pulse_cache:**
+```bash
+~/Brave_New_Commune/rust_daemons/pulse_cache/target/release/pulse_cache
+```
+
+You should see:
+```
+[pulse_cache] Brave New Commune pulse daemon v2 starting.
+[pulse_cache] Watching  : /home/YOU/Brave_New_Commune/pulse_cache
+[pulse_cache] Database  : /home/YOU/Brave_New_Commune/data/colab/commune.db
+[pulse_cache] Prune at  : 50 entries per agent
+[pulse_cache] Listening for .json blobs. Ctrl+C to stop.
+```
+
+**Terminal 3 — start memory_garden:**
+```bash
+~/Brave_New_Commune/rust_daemons/memory_garden/target/release/memory_garden
+```
+
+You should see:
+```
+[memory-garden] Infinite Vault schema ready.
+[memory-garden] WebSocket hub: ws://127.0.0.1:3030/stream
+[memory-garden] Watching cache/ for new pulses. Ctrl+C to stop.
+```
+
+**Start order:** Start the daemons BEFORE starting the Python sim. If you forget, it's fine — both daemons will replay any .json files that piled up while they were offline.
+
+---
+
+## PART 4: CONNECTING THE PYTHON SIM TO THE DAEMONS
+
+Copy `pulse_writer.py` into the same folder as `bravenewcommune.py`.
+
+Then in `bravenewcommune.py`, add this import near the top with the other imports:
+
+```python
+from pulse_writer import write_pulse
+```
+
+Then find the `_write_diary` method and add a pulse write at the end:
+
+```python
+def _write_diary(self, agent: dict, content: str):
+    self.states[agent["name"]].diary_entries.append(content)
+    self._append_jsonl(
+        self.diary_dir / agent["name"].lower() / f"day_{self.day:03d}.jsonl",
+        {
+            "timestamp": self.now_iso(), "day": self.day,
+            "tick": self.tick, "agent": agent["name"],
+            "type": "diary", "content": content,
+        },
+    )
+    # NEW: emit to Rust daemons
+    write_pulse(
+        agent["name"],
+        why=f"Day {self.day} tick {self.tick} diary",
+        what=content[:500],          # first 500 chars
+        feeling="reflective",
+        sensory="internal",
+        target="both",
+    )
+```
+
+That's it. No other changes needed. The daemons handle everything else.
+
+---
+
+## PART 5: INSTALLING DUCKDUCKGO SEARCH
+
+### Step 1 — Install the library
+```bash
+pip install duckduckgo-search
+```
+
+No API key. No account. No credit card. It just works.
+
+### Step 2 — Copy search_integration.py to your project folder
+Place it alongside `bravenewcommune.py`.
+
+### Step 3 — Add the import to bravenewcommune.py
+Near the top of the file, with the other imports:
+```python
+from search_integration import rate_limited_search
+```
+
+### Step 4 — Add search capability to agent prompts
+
+Find the `_context` method in `BraveNewCommune`. You don't need to change it.
+
+Instead, add a new helper method right after `_context`:
+
+```python
+def _maybe_search(self, agent: dict, topic: str) -> str:
+    """
+    Let an agent search DuckDuckGo on a topic and get results back
+    as a string that can be injected into their next prompt.
+    Only called when you explicitly want an agent to search.
+    """
+    print(f"\n  [search] {agent['name']} searching: {topic}", flush=True)
+    result = rate_limited_search(topic, max_results=4)
+    # Also log it to the agent's diary so it becomes part of memory
+    self._write_diary(agent, f"[WEB SEARCH: {topic}]\n{result}")
+    return result
+```
+
+### Step 5 — Use search in the run loop (optional but recommended)
+
+In the `run()` method, you can add search to the collaboration notes section (every 10 ticks). Find this block:
+
+```python
+# Collaboration notes — every 10 ticks, silent
+if tick % 10 == 0:
+```
+
+And inside the agent loop for collaboration notes, you can optionally let agents search. For example, add before the `client.chat()` call:
+
+```python
+# Let Hel and Codex search for technical topics periodically
+search_context = ""
+if agent["name"] in ("Hel", "Codex") and tick % 20 == 0:
+    search_context = self._maybe_search(
+        agent,
+        f"open source AI memory systems {self.day}"
+    )
+```
+
+Then add `search_context` into the prompt string:
+```python
+prompt = (
+    f"Day {self.day}, tick {tick}. Commune focus: {focus}\n\n"
+    f"{self._context(agent)}\n\n"
+    + (f"Fresh web research:\n{search_context}\n\n" if search_context else "")
+    + "Write a collaboration note (50–100 words). "
+      "Propose something concrete to build or explore."
+)
+```
+
+---
+
+## PART 6: PERMISSIONS — WHAT YOU ACTUALLY NEED
+
+**DuckDuckGo:** No permissions needed. It's a plain HTTP request to a public endpoint. No firewall rules, no sudo, nothing.
+
+**Google via SerpAPI (optional):** Also no system permissions. Just a free account at serpapi.com for a key. Free tier = 100 searches/month. You paste the key as a string in the code.
+
+**The Rust daemons:** No elevated permissions. They only read/write files in your home directory and open a local WebSocket port (3030). If you ever see a firewall popup when starting memory_garden, allow it — but on most Linux setups nothing will prompt at all since it only binds to `127.0.0.1` (localhost only, not exposed to the network).
+
+**Summary: zero sudo, zero API keys for DDG, zero firewall changes needed.**
+
+---
+
+## PART 7: VERIFYING EVERYTHING WORKS
+
+### Test pulse_cache:
+```bash
+# While pulse_cache is running in its terminal, open another terminal and run:
+echo '{"who":"Sara","why":"test","what":"hello world","feeling":"curious","sensory":"digital"}' \
+  > ~/Brave_New_Commune/pulse_cache/test_sara.json
+```
+
+You should immediately see in the pulse_cache terminal:
+```
+[pulse_cache] stored — agent='Sara' feeling='curious' sensory='digital'
+```
+
+And the test file should be gone (deleted after processing). ✓
+
+### Test memory_garden:
+```bash
+echo '{"who":"Hel","why":"test","what":"memory test","feeling":"focused","sensory":"electric"}' \
+  > ~/Brave_New_Commune/memory-garden/cache/test_hel.json
+```
+
+You should see in the memory_garden terminal:
+```
+[memory-garden] Archived pulse — who='Hel' feeling='focused'
+```
+
+### Test DuckDuckGo search:
+```bash
+python3 -c "
+from search_integration import ddg_search
+print(ddg_search('open source AI memory systems', max_results=2))
+"
+```
+
+You should see 2 search results printed with titles, URLs, and snippets.
+
+### Test WebSocket (optional, for the curious):
+```bash
+# Install wscat if you want to test manually
+npm install -g wscat
+wscat -c ws://127.0.0.1:3030/stream
+# Then drop a .json file in the cache dir — you'll see it arrive live in this terminal
+```
+
+---
+
+## PART 8: MAKING DAEMONS START AUTOMATICALLY (optional quality-of-life)
+
+If you want the daemons to start automatically when you boot MX Linux without opening terminals manually, create two simple systemd user services:
+
+```bash
+mkdir -p ~/.config/systemd/user
+
+# pulse_cache service
+cat > ~/.config/systemd/user/pulse_cache.service << 'EOF'
+[Unit]
+Description=Brave New Commune pulse_cache daemon
+After=network.target
+
+[Service]
+ExecStart=%h/Brave_New_Commune/rust_daemons/pulse_cache/target/release/pulse_cache
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+EOF
+
+# memory_garden service
+cat > ~/.config/systemd/user/memory_garden.service << 'EOF'
+[Unit]
+Description=Brave New Commune memory_garden daemon
+After=network.target
+
+[Service]
+ExecStart=%h/Brave_New_Commune/rust_daemons/memory_garden/target/release/memory_garden
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+EOF
+
+# Enable them
+systemctl --user enable pulse_cache memory_garden
+systemctl --user start  pulse_cache memory_garden
+
+# Check status
+systemctl --user status pulse_cache
+systemctl --user status memory_garden
+```
+
+After this, they start on boot automatically with no terminal needed. Logs go to:
+```bash
+journalctl --user -u pulse_cache -f
+journalctl --user -u memory_garden -f
+```
+
+---
+
+## QUICK REFERENCE CARD
+
+| What | Command |
+|------|---------|
+| Build pulse_cache | `cd ~/rust_daemons/pulse_cache && cargo build --release` |
+| Build memory_garden | `cd ~/rust_daemons/memory_garden && cargo build --release` |
+| Run pulse_cache | `./target/release/pulse_cache` |
+| Run memory_garden | `./target/release/memory_garden` |
+| Install search | `pip install duckduckgo-search` |
+| View short-term DB | `sqlite3 ~/Brave_New_Commune/data/colab/commune.db "SELECT * FROM pulses ORDER BY ts DESC LIMIT 10;"` |
+| View long-term DB | `sqlite3 ~/Brave_New_Commune/memory-garden/garden.db "SELECT * FROM pulses ORDER BY id DESC LIMIT 10;"` |
