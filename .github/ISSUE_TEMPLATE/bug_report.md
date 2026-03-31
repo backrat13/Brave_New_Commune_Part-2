@@ -1,38 +1,8 @@
----
-name: Bug report
-about: Create a report to help us improve
-title: ''
-labels: ''
-assignees: ''
+Errors from bravenewcommune.py
 
----
+File "/home/splinter/Brave_New_Commune2/bravenewcommune2.py", line 1337, in <module>  File "/home/splinter/Brave_New_Commune2/bravenewcommune2.py", line 1333, in main  File "/home/splinter/Brave_New_Commune2/bravenewcommune2.py", line 1191, in run  File "/home/splinter/Brave_New_Commune2/bravenewcommune2.py", line 982, in _write_diary  File "/home/splinter/Brave_New_Commune2/bravenewcommune2.py", line 659, in _append_jsonl  File "/usr/lib/python3.13/pathlib/_local.py", line 539, in open    return io.open(self, mode, buffering, encoding, errors, newline)           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ FileNotFoundError: [Errno 2] No such file or directory: '/home/splinter/Brave_New_Commune2/data/diary/mira/day_001.jsonl''
 
-**Describe the bug**
-A clear and concise description of what the bug is.
 
-**To Reproduce**
-Steps to reproduce the behavior:
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
+I fixed this in bravenewcommune2.py
 
-**Screenshots**
-If applicable, add screenshots to help explain your problem.
-
-**Desktop (please complete the following information):**
- - OS: [e.g. iOS]
- - Browser [e.g. chrome, safari]
- - Version [e.g. 22]
-
-**Smartphone (please complete the following information):**
- - Device: [e.g. iPhone6]
- - OS: [e.g. iOS8.1]
- - Browser [e.g. stock browser, safari]
- - Version [e.g. 22]
-
-**Additional context**
-Add any other context about the problem here.
