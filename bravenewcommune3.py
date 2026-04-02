@@ -18,10 +18,12 @@ Fixes in v009:
 
 import argparse
 import json
+import math
 import re
 import sys
 import time
 import textwrap
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,12 +47,16 @@ except ImportError:
     PDF_AVAILABLE = False
 
 try:
+    # Modern implementation for the 'ddgs' package
     from duckduckgo_search import DDGS
     DDG_AVAILABLE = True
 except ImportError:
-    DDG_AVAILABLE = False
-
-
+    try:
+        # Fallback for older versions of duckduckgo_search
+        from duckduckgo_search import ddg as DDGS
+        DDG_AVAILABLE = True
+    except ImportError:
+        DDG_AVAILABLE = False
 # ============================================================
 # AGENTS
 # ============================================================
@@ -192,8 +198,8 @@ class AgentState:
     kernels:       List[str] = field(default_factory=list)
     axioms:        dict      = field(default_factory=lambda: dict(DEFAULT_AXIOMS))
 
-    CONSOLIDATE_AT    = 150
-    CONSOLIDATE_BATCH = 50
+    CONSOLIDATE_AT    = 20
+    CONSOLIDATE_BATCH = 20
 
 
 # ============================================================
@@ -299,6 +305,89 @@ def _build_search_query(agent: dict, focus: str) -> str:
     short = " ".join(focus.split()[:8])
     return f"{short} {agent['role']}"
 
+
+# ============================================================
+# LOCAL RAG MEMORY
+# ============================================================
+
+class SimpleRAGMemory:
+    """
+    Lightweight local retrieval over prior commune memory.
+    Uses token-overlap + IDF weighting + light recency bonus.
+    No external services, no extra dependencies.
+    """
+    TOKEN_RE = re.compile(r"[a-zA-Z0-9_'-]{2,}")
+
+    def __init__(self):
+        self.docs = []
+        self.df = Counter()
+        self.doc_count = 0
+
+    def _tokens(self, text: str):
+        return [t.lower() for t in self.TOKEN_RE.findall(text or "")]
+
+    def add_document(self, agent: str, source: str, content: str, day: int, tick: int):
+        content = (content or '').strip()
+        if not content:
+            return
+        tokens = self._tokens(content)
+        if not tokens:
+            return
+        counts = Counter(tokens)
+        unique = set(counts)
+        for tok in unique:
+            self.df[tok] += 1
+        self.doc_count += 1
+        self.docs.append({
+            'agent': agent,
+            'source': source,
+            'content': content,
+            'day': day,
+            'tick': tick,
+            'counts': counts,
+            'length': sum(counts.values()),
+        })
+
+    def _idf(self, token: str) -> float:
+        return math.log((1 + self.doc_count) / (1 + self.df.get(token, 0))) + 1.0
+
+    def retrieve(self, query: str, agent: str = '', k: int = 4, max_chars: int = 1400) -> str:
+        q_tokens = self._tokens(query)
+        if not q_tokens or not self.docs:
+            return ''
+        q_counts = Counter(q_tokens)
+        q_norm = math.sqrt(sum((freq * self._idf(tok)) ** 2 for tok, freq in q_counts.items())) or 1.0
+
+        scored = []
+        for idx, doc in enumerate(self.docs):
+            overlap = set(q_counts) & set(doc['counts'])
+            if not overlap:
+                continue
+            dot = sum((q_counts[t] * self._idf(t)) * (doc['counts'][t] * self._idf(t)) for t in overlap)
+            d_norm = math.sqrt(sum((freq * self._idf(tok)) ** 2 for tok, freq in doc['counts'].items())) or 1.0
+            sim = dot / (q_norm * d_norm)
+            same_agent_bonus = 0.08 if agent and doc['agent'] == agent else 0.0
+            recency_bonus = min(0.10, idx / max(1, len(self.docs)) * 0.10)
+            score = sim + same_agent_bonus + recency_bonus
+            scored.append((score, idx, doc))
+
+        if not scored:
+            return ''
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        parts, total = [], 0
+        for score, _, doc in scored[:k]:
+            entry = (
+                f"[{doc['source']} | {doc['agent']} | Day {doc['day']} T{doc['tick']} | {score:.2f}] "
+                f"{doc['content']}"
+            )
+            if total + len(entry) > max_chars:
+                break
+            parts.append(entry)
+            total += len(entry)
+        if not parts:
+            return ''
+        return "Retrieved relevant prior memory:\n" + "\n\n".join(parts)
 
 # ============================================================
 # OLLAMA CLIENT
@@ -509,6 +598,7 @@ class CommuneAPI:
                 "agents":         [a["name"] for a in AGENTS],
                 "ducksearch":     self.commune.enable_ducksearch,
                 "library_chunks": len(self.commune.library.chunks),
+                "rag_docs":       len(self.commune.rag.docs),
             }), 200
 
     def start(self):
@@ -545,7 +635,7 @@ class BraveNewCommune2:
         day:               int,
         base_url:          str  = "http://127.0.0.1:11434",
         api_port:          int  = 5001,
-        enable_ducksearch: bool = False,
+        enable_ducksearch: bool = True,
     ):
         self.root              = root.expanduser().resolve()
         self.data_dir          = self.root / "data"
@@ -600,6 +690,7 @@ class BraveNewCommune2:
         self.rules_records:  List[dict] = []
         self.last_admin_q   = ""
         self.library        = LibraryReader(self.library_dir)
+        self.rag            = SimpleRAGMemory()
         self.api            = CommuneAPI(self, port=api_port)
 
         self._bootstrap()
@@ -653,12 +744,14 @@ class BraveNewCommune2:
     def _load_all(self):
         for rec in self._read_jsonl(self.board_jsonl):
             self.board_records.append(rec)
+            self.rag.add_document(rec.get("agent", ""), "board", rec.get("content", ""), rec.get("day", 0), rec.get("tick", 0))
             st = self.states.get(rec.get("agent", ""))
             if st:
                 st.board_entries.append(rec.get("content", ""))
 
         for rec in self._read_jsonl(self.colab_jsonl):
             self.colab_records.append(rec)
+            self.rag.add_document(rec.get("agent", ""), "colab", rec.get("content", ""), rec.get("day", 0), rec.get("tick", 0))
             st = self.states.get(rec.get("agent", ""))
             if st:
                 st.colab_entries.append(rec.get("content", ""))
@@ -675,6 +768,7 @@ class BraveNewCommune2:
 
         for rec in self._read_jsonl(self.rules_jsonl):
             self.rules_records.append(rec)
+            self.rag.add_document(rec.get("agent", ""), "rule", rec.get("content", ""), rec.get("day", 0), rec.get("tick", 0))
 
         for agent in AGENTS:
             st        = self.states[agent["name"]]
@@ -689,8 +783,11 @@ class BraveNewCommune2:
                     if entry_type == "kernel":
                         st.kernels.append(content)
                         st.diary_entries.append(f"[MEMORY KERNEL] {content}")
+                        self.rag.add_document(agent["name"], "kernel", content, rec.get("day", 0), rec.get("tick", 0))
                     else:
-                        st.diary_entries.append(f"{label}{content}")
+                        enriched = f"{label}{content}"
+                        st.diary_entries.append(enriched)
+                        self.rag.add_document(agent["name"], "diary", enriched, rec.get("day", 0), rec.get("tick", 0))
 
         for agent in AGENTS:
             st        = self.states[agent["name"]]
@@ -712,6 +809,7 @@ class BraveNewCommune2:
         agent: dict,
         include_library: bool = True,
         web_results: str = "",
+        use_rag: bool = True,
     ) -> str:
         st    = self.states[agent["name"]]
         parts = []
@@ -745,9 +843,9 @@ class BraveNewCommune2:
                 + "\n".join(f"  {r['agent']}: {r['content']}" for r in self.rules_records)
             )
 
-        # Board — capped at last 15 posts
+        # Board — capped at last 50 posts
         if self.board_records:
-            recent = self.board_records[-15:]
+            recent = self.board_records[-50:]
             parts.append(
                 f"Recent message board ({len(recent)} posts):\n"
                 + "\n".join(f"  {r['agent']}: {r['content']}" for r in recent)
@@ -762,6 +860,15 @@ class BraveNewCommune2:
         # Web results
         if web_results:
             parts.append("Live web results:\n" + web_results)
+
+        if use_rag:
+            rag_query_parts = [st.axioms.get("core_belief", ""), st.axioms.get("on_memory", ""), self.focus_file.read_text(encoding="utf-8").strip() if self.focus_file.exists() else ""]
+            if self.board_records:
+                rag_query_parts.extend(r["content"] for r in self.board_records[-6:])
+            rag_query = " ".join(p for p in rag_query_parts if p).strip()
+            rag_ctx = self.rag.retrieve(rag_query, agent=agent["name"], k=4, max_chars=1400)
+            if rag_ctx:
+                parts.append(rag_ctx)
 
         return "\n\n".join(parts)
 
@@ -823,7 +930,7 @@ class BraveNewCommune2:
                 f"contradictions_found (array), evolution_log (array)\n\n"
                 f"{{"
             ),
-            max_tokens=1800,
+            max_tokens=2800,
             temperature=0.65,
             stream=False,
             agent_name=name,
@@ -938,12 +1045,15 @@ class BraveNewCommune2:
     # ── write helpers (all guard empty content) ───────────────
 
     def _post_board(self, agent: dict, content: str):
+        if not content.strip():
+            return
         rec = {
             "timestamp": self.now_iso(), "day": self.day,
             "tick": self.tick, "agent": agent["name"], "content": content,
         }
         self.board_records.append(rec)
         self.states[agent["name"]].board_entries.append(content)
+        self.rag.add_document(agent["name"], "board", content, self.day, self.tick)
         self._append_jsonl(self.board_jsonl, rec)
         self._append_txt(
             self.board_txt,
@@ -954,6 +1064,7 @@ class BraveNewCommune2:
         if not content.strip():
             return
         self.states[agent["name"]].diary_entries.append(content)
+        self.rag.add_document(agent["name"], "diary", content, self.day, self.tick)
         self._append_jsonl(
             self.diary_dir / agent["name"].lower() / f"day_{self.day:03d}.jsonl",
             {"timestamp": self.now_iso(), "day": self.day,
@@ -970,6 +1081,7 @@ class BraveNewCommune2:
         }
         self.colab_records.append(rec)
         self.states[agent["name"]].colab_entries.append(content)
+        self.rag.add_document(agent["name"], "colab", content, self.day, self.tick)
         self._append_jsonl(self.colab_jsonl, rec)
         self._append_txt(
             self.colab_txt,
@@ -984,6 +1096,7 @@ class BraveNewCommune2:
             "tick": self.tick, "agent": agent["name"], "content": content,
         }
         self.rules_records.append(rec)
+        self.rag.add_document(agent["name"], "rule", content, self.day, self.tick)
         self._append_jsonl(self.rules_jsonl, rec)
         self._append_txt(
             self.rules_txt,
@@ -1001,6 +1114,7 @@ class BraveNewCommune2:
                 "colab_notes":    len(self.colab_records),
                 "rules_proposed": len(self.rules_records),
                 "library_chunks": len(self.library.chunks),
+                "rag_docs":       len(self.rag.docs),
                 "ducksearch":     self.enable_ducksearch,
             }, indent=2),
             encoding="utf-8",
@@ -1055,7 +1169,7 @@ class BraveNewCommune2:
         content = self.client.chat(
             system_prompt=self._system(agent),
             user_prompt=prompt,
-            max_tokens=350,
+            max_tokens=750,
             temperature=0.85,
             stream=True,
             prefix=f"\n{agent['name']}: ",
@@ -1073,7 +1187,7 @@ class BraveNewCommune2:
                 f"You are {agent['name']}. Write 2-3 sentences — "
                 f"the most important thing on your mind right now. Plain prose."
             ),
-            max_tokens=150,
+            max_tokens=275,
             temperature=0.80,
             stream=False,
             agent_name=agent["name"],
@@ -1113,6 +1227,7 @@ class BraveNewCommune2:
             f"Library:    {len(self.library.chunks)} chunks "
             f"({'active' if not self.library.is_empty else 'empty — drop files into data/library/'})\n"
             f"DuckSearch: {'ACTIVE' if self.enable_ducksearch else 'off'}\n"
+            f"RAG:        {len(self.rag.docs)} docs indexed\n"
             f"num_ctx:    {OllamaClient.NUM_CTX}  |  Empty-post guard: ACTIVE"
         )
 
@@ -1256,7 +1371,8 @@ def parse_args():
         epilog=textwrap.dedent("""
         Examples:
           python bravenewcommune2.py --day 1 --ticks 25
-          python bravenewcommune2.py --day 2 --ticks 25 --enable-ducksearch
+          python bravenewcommune2.py --day 2 --ticks 25
+          python bravenewcommune2.py --day 2 --ticks 25 --disable-ducksearch
           python bravenewcommune2.py --day 1 --model llama3:8b --ticks 10
         """),
     )
@@ -1267,15 +1383,15 @@ def parse_args():
     p.add_argument("--day",               type=int,   default=1)
     p.add_argument("--base-url",          default="http://127.0.0.1:11434")
     p.add_argument("--api-port",          type=int,   default=5001)
-    p.add_argument("--enable-ducksearch", action="store_true")
+    p.add_argument("--disable-ducksearch", action="store_true")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    if args.enable_ducksearch and not DDG_AVAILABLE:
+    if not args.disable_ducksearch and not DDG_AVAILABLE:
         print(
-            "[WARN] --enable-ducksearch set but duckduckgo-search not installed.\n"
+            "[WARN] DuckDuckGo default is on but duckduckgo-search is not installed.\n"
             "       pip install duckduckgo-search\n"
             "       Continuing without web search.",
             flush=True,
@@ -1288,7 +1404,7 @@ def main():
         day=args.day,
         base_url=args.base_url,
         api_port=args.api_port,
-        enable_ducksearch=args.enable_ducksearch,
+        enable_ducksearch=not args.disable_ducksearch,
     ).run()
 
 
